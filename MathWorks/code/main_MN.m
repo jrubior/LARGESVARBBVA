@@ -1,6 +1,6 @@
 clearvars
 close all
-clc
+
 % test github
 
 data = fullfile('data.csv');
@@ -13,7 +13,7 @@ Y = tbl{:,2:end}*100;
 
 %% Model parameters 
 nvar      = size(Y,2);       % number of endogenous variables
-nlag      = 2;               % number of lags
+nlag      =1;               % number of lags
 nex       = 1;               % set equal to 1 if a constant is included; 0 otherwise
 m         = nvar*nlag + nex; % number of exogenous variables
 T         = size(Y,1) - nlag; % sample
@@ -24,8 +24,8 @@ pos       = []; % if there is variables that are stationary.
 disp('MN Prior')
 
 Vc=1e4;
-lambda1=.1;
-lambda3=2;
+lambda1=0.2;
+lambda3=4;
 
 % nnuBar
 nnuBar = nvar+2;
@@ -52,7 +52,7 @@ if nex==1
     OomegaBar(end,end) = Vc;
 end
 
-KK=((nnuBar-nlag-1)*(lambda1^2))*inv(diag(((1:nlag)'.^lambda3)));
+KK=((nnuBar-nvar-1)*(lambda1^2))*inv(diag(((1:nlag)'.^lambda3)));
 OomegaTilde=kron(KK,PphiBar\eye(nvar));
 OomegaBar(1:end-nex, 1:end-nex) = OomegaTilde;
 
@@ -147,13 +147,7 @@ fprintf('Distance from M7 to M3: %.4f\n', norm(M7 - M3, 'fro'));
 fprintf('Distance from M8 to M3: %.4f\n', norm(M8 - M3, 'fro'));
 
 
-save('MN.mat','nnuBar','PphiBar','PpsiBar','OomegaBar') 
-
-
-
-
-
-
+PostMdl.Omega
 
 
 

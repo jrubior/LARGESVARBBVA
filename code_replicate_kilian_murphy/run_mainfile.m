@@ -1,0 +1,347 @@
+%==========================================================================
+%% housekeeping
+%==========================================================================
+clear variables;close all;userpath('clear');restoredefaultpath;clc;
+tic;
+rng('default'); % reinitialize the random number generator to its startup configuration
+seed =0;
+rng(seed,'twister');         % set seed
+currdir=pwd;
+addpath([currdir,'/data']); % set path to data functions
+addpath([currdir,'/helpfunctions']); % set path to helper functions
+addpath([currdir,'/helpfunctions/ChrisSimsOptimize']);
+addpath([currdir,'/helpfunctions/subroutines']); % set path to helper functions
+cd(currdir)
+
+
+%==========================================================================
+%% load the data 
+%==========================================================================
+load('kmData.mat')
+% percent change in global oil production, real activity index from Kilian(AER 2009), the log real price of oil, and changes in OECD crude oil inventories
+
+%tstart = find(all((datesq.FEDFUNDS=='1986-03-31'),2)==1); % start estimation with 1986:Q1
+%tend   = size(yall,1) - 1;                                % end estimation with 2008:Q3
+%YY     = yall(tstart:tend,:);
+num    = kmData;
+
+%=========================================================================
+%% model setup
+%==========================================================================
+nlag      = 24;                     % number of lags
+nvar      = size(num,2);           % number of endogenous variables
+nex       = 12;                     % 12 because of seasonal dummies
+m         = nvar*nlag + nex;       % number of exogenous variables
+horizon   = 20;                    % maximum horizon for IRFs
+horizons  = [0,1,2,3,4,inf];       % horizons upon which sign and zero restrictions can be imposed
+NS        = 1 + numel(horizons);   % number of objects in F(THETA) to which we impose sign and zero restrictions: F(THETA)=[A_0;L_{0};L_{1};L_{2};L_{3};L_{4};L_{inf}]
+e         = eye(nvar);             % create identity matrix
+maxBSQdraws2store  =1e2;        
+conjugate  = 'none';
+iter_show  = 1e4;
+fixed_rf   = 1;
+prior_only = 0;
+label_R = 'kilianmurphy';
+prior_type = 'flat';
+%==========================================================================
+%% Setup info/settings and IDENTIFYING RESTRICTIONS
+%==========================================================================
+info=SetupInfo(nvar,m, nlag,horizons,@(x)chol(x));
+
+
+%==========================================================================
+%% Mappings
+%==========================================================================
+fo                 = @(x)f_h(x,info);
+fo_inv             = @(x)f_h_inv(x,info);
+fo_str2irfs        = @(x)StructuralToIRF(x,info);
+fo_str2irfs_inv    = @(x)IRFToStructural(x,info);
+
+%==========================================================================
+%% write data in Rubio, Waggoner, and Zha (RES 2010)'s notation
+%==========================================================================
+% yt(t) A0 = xt(t) Aplus + constant + et(t) for t=1...,T;
+% yt(t)    = xt(t) B     + ut(t)            for t=1...,T;
+% x(t)     = [constant,yt(t-1), ... ,yt(t-nlag)];
+% matrix notation yt = xt*B + ut;
+% xt=[yt_{-1} ones(T,1)];
+y0bar = mean(num(1:nlag,:),1);% useful for GLP prior
+info.y0bar = y0bar;
+
+Tnum = size(num,1);
+yt   = num(nlag+1:end,:);
+T    = size(yt,1);
+
+%creating SA dummies
+ x=[eye(11); zeros(1,11)];
+X2=[];
+for i=1:fix((Tnum-nlag)/12)  %number of years
+    X2=[X2;x];
+end
+[l w] =size(X2);
+last=[eye((Tnum-nlag)-l), zeros((Tnum-nlag)-l,11-((Tnum-nlag)-l))];
+X2=[X2;last];
+X2=[ones(Tnum-nlag,1), X2];
+
+
+xt = zeros(T,nvar*nlag+nex);
+for i=1:nlag
+    xt(:,nex+nvar*(i-1)+1:nex+nvar*i) = num((nlag-(i-1)):end-i,:) ;
+end
+
+
+
+if nex==1
+    xt(:,1)=ones(T,1);
+end
+if nex==12
+    xt(:,1:12)=X2;
+end
+
+
+% write data in Zellner (1971, pp 224-227) notation
+Y = yt; % T by nvar matrix of observations
+X = xt; % T by (nvar*nlag+1) matrix of regressors
+
+Ynd = Y;
+Xnd = X;
+
+%% prior for reduced-form parameters
+
+
+% prior
+nnuBar             = 0;
+OomegaBarInverse   = zeros(m);
+mmuBar             = zeros(m,nvar);  % Psi in the paper
+PpsiBar            = zeros(nvar);    % Phi in the paper
+
+
+
+%% posterior for reduced-form parameters
+nnuTilde            = T +nnuBar;
+OomegaTilde         = (X'*X  + OomegaBarInverse)\eye(m);
+OomegaTildeInverse  =  X'*X  + OomegaBarInverse;
+mmuTilde            = (X'*X  + OomegaBarInverse)\(X'*Y + OomegaBarInverse*mmuBar);
+PpsiTilde           = Y'*Y + PpsiBar + mmuBar'*OomegaBarInverse*mmuBar - mmuTilde'*OomegaTildeInverse*mmuTilde;
+PpsiTilde           = (PpsiTilde'+PpsiTilde)*0.5;
+
+%% Parameters to fix reduced-form
+BHat            = (X'*X)\(X'*Y);
+SigmaHat           = (Y-X*BHat)'*(Y-X*BHat)/size(Y,1);
+SigmaHat           = (SigmaHat'+SigmaHat)*0.5;
+
+
+%% useful definitions
+% definitios used to store orthogonal-reduced-form draws, volume elements, and unnormalized weights
+Bdraws         = cell([maxBSQdraws2store,1]); % reduced-form lag parameters
+Sigmadraws     = cell([maxBSQdraws2store,1]); % reduced-form covariance matrices
+Qdraws         = cell([maxBSQdraws2store,1]); % orthogonal matrices
+
+
+% definitions related to IRFs and stability of the coefficients; based on page 12 of Rubio, Waggoner, and Zha (RES 2010)
+J      = [e;repmat(zeros(nvar),nlag-1,1)];
+A      = cell(nlag,1);
+extraF = repmat(zeros(nvar),1,nlag-1);
+bigF      = zeros(nlag*nvar,nlag*nvar);
+for l=1:nlag-1
+    bigF((l-1)*nvar+1:l*nvar,nvar+1:nlag*nvar)=[repmat(zeros(nvar),1,l-1) e repmat(zeros(nvar),1,nlag-(l+1))];
+end
+
+% definition to facilitate the draws from B|Sigma
+hh              = info.h;
+cholOomegaTilde = hh(OomegaTilde)'; % this matrix is used to draw B|Sigma below
+
+if prior_only==1
+cholOomegaBar   = hh(OomegaBar)'; % this matrix is used to draw B|Sigma below
+end
+
+%% initialize counters to track the state of the computations
+counter = 1;
+count   = 0;
+tStart = tic;
+
+
+while count<maxBSQdraws2store
+
+    if fixed_rf==1
+
+
+           Sigmadraw     = SigmaHat;
+           Bdraw         = BHat ;
+
+
+
+
+       
+    elseif prior_only==1
+        %% Draw Sigma
+        Sigmadraw     = iwishrnd(PpsiBar,nnuBar);
+        cholSigmadraw = hh(Sigmadraw)';
+        Bdraw         = kron(cholSigmadraw,cholOomegaBar)*randn(m*nvar,1) + reshape(mmuBar,nvar*m,1);
+        Bdraw         = reshape(Bdraw,nvar*nlag+nex,nvar);
+    else
+
+        %% Draw Sigma
+        Sigmadraw     = iwishrnd(PpsiTilde,nnuTilde);
+        cholSigmadraw = hh(Sigmadraw)';
+        Bdraw         = kron(cholSigmadraw,cholOomegaTilde)*randn(m*nvar,1) + reshape(mmuTilde,nvar*m,1);
+        Bdraw         = reshape(Bdraw,nvar*nlag+nex,nvar);
+
+    end
+
+
+
+    %% Draw Q
+    Qdraw        = DrawQ(info.nvar);
+    x            = [vec(Bdraw); vec(Sigmadraw); vec(Qdraw)];
+    structpara   = f_h_inv(x,info);
+    irfpara      = fo_str2irfs(structpara);
+
+
+
+    %% check if sign restrictions hold
+
+    L0 =reshape(irfpara(1:nvar*nvar,:),nvar,nvar);
+
+
+    switch label_R 
+        
+        case 'kilianmurphy'
+
+
+            supply_shock = (L0(1,1)<0)*(L0(2,1)<0)*(L0(3,1)>0);
+            flow_demand_shock = (L0(1,2)>0)*(L0(2,2)>0)*(L0(3,2)>0);
+            spec_demand_shock = (L0(1,3)>0)*(L0(2,3)<0)*(L0(3,3)>0)*(L0(4,3)>0);
+            %spec_demand_shock = (L0(1,4)>0)*(L0(2,4)<0)*(L0(3,4)>0)*(L0(4,4)>0);
+
+
+            elasticity=L0(1,3)./L0(3,3);   %supply elasticity in response to speculative demand shock
+            ADelas    =L0(1,2)./L0(3,2);   %supply elasticity in response to flow demand shock
+    
+
+            %elasticity2=L0(1,4)./L0(3,4)
+
+            elast_restrictions = (ADelas<=.0258);%(elasticity<=.0258)*(ADelas<=.0258);
+
+            label= supply_shock*flow_demand_shock*spec_demand_shock*elast_restrictions;
+
+        case 'nolabel'
+            label = 1;
+
+    end
+
+
+   
+   if label>0  
+
+        count=count+1;
+
+        % store orthogonal reduced-form draws
+        Bdraws{count,1}     = Bdraw;
+        Sigmadraws{count,1} = Sigmadraw;
+        Qdraws{count,1} = reshape(Qdraw,nvar,nvar);
+
+
+    
+
+
+    end
+
+    if rem(counter,iter_show)==0
+
+        display(['Number of draws = ',num2str(count)])
+        display(['Remaining draws = ',num2str(maxBSQdraws2store-(count))])
+       
+
+    end
+
+        if rem(counter,10000)==0
+
+        display(['draws = ',num2str(counter)])
+ 
+
+        end
+
+    counter = counter + 1;
+
+
+
+end
+
+
+tElapsed = toc(tStart);
+
+
+ne = count;
+
+
+% alternative method for importance weights: imp_w and imp_w_check must be identical
+%imp_w_check  = uwcheck/sum(uwcheck);
+%max(abs(imp_w-imp_w_check))
+
+
+
+%% store draws
+L        = zeros(horizon+1,nvar,nvar,ne); % define array to store IRF
+cumL     = zeros(horizon+1,nvar,nvar,ne);
+A0       = zeros(nvar,nvar,ne); % define array to store A0
+Aplus    = zeros(m,nvar,ne); % define array to store Aplus
+hist_is_draws = zeros(ne,1);   % define array to store draws from importance sampler
+
+for s=1:min(ne,maxBSQdraws2store)
+
+    %% draw: B,Sigma,Q
+    is_draw = s;
+
+    Bdraw       = Bdraws{is_draw,1};
+    Sigmadraw   = Sigmadraws{is_draw,1};
+    Qdraw       = Qdraws{is_draw,1};
+
+
+    x=[reshape(Bdraw,m*nvar,1); reshape(Sigmadraw,nvar*nvar,1); Qdraw(:)];
+    structpara = f_h_inv(x,info);
+
+    % irf para to unit modulus para
+    irfpara      = fo_str2irfs(structpara);
+
+    LIRF = IRF_horizons(structpara, nvar, nlag, m, nex, 0:horizon);
+
+
+    for h=0:horizon
+        L(h+1,:,:,s) =  LIRF(1+h*nvar:(h+1)*nvar,:);
+      
+        for i=1:nvar
+            cumL(h+1,1:4,i,s)   = sum(L(1:h+1,1:4,i,s),1);
+        end
+
+    end
+
+
+
+    A0(:,:,s)    = reshape(structpara(1:nvar*nvar),nvar,nvar);
+    Aplus(:,:,s) = reshape(structpara(nvar*nvar+1:end),m,nvar);
+
+
+
+end
+
+A0    = A0(:,:,1:s);
+Aplus = Aplus(:,:,1:s);
+L     = L(:,:,:,1:s);
+cumL  = cumL(:,:,:,1:s);
+
+
+cd results
+
+   if ~exist('matfiles', 'dir')
+       mkdir('matfiles')
+   end
+
+
+    savefile= ['matfiles/r_',label_R,'prior_only_',num2str(prior_only),'prior_',prior_type,'fixed_rf_',num2str(fixed_rf),'.mat'];
+
+save(savefile,'L','cumL','ne','horizon','counter');
+cd ..
+
+
+
